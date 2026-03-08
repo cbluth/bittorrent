@@ -71,9 +71,9 @@ type Node struct {
 	address *net.UDPAddr // Network address
 
 	// Local node fields (only set for the local node)
-	conn           *net.UDPConn // UDP socket (only for local node)
-	port           uint16       // Listening port (only for local node)
-	dht            *DHT         // DHT routing table (only for local node)
+	conn           net.PacketConn // Network connection (only for local node)
+	port           uint16         // Listening port (only for local node)
+	dht            *DHT           // DHT routing table (only for local node)
 	bootstrapNodes []*net.UDPAddr
 	readOnly       bool // BEP 43: read-only mode — don't respond to queries, set ro=1 in outgoing
 
@@ -118,6 +118,18 @@ func NewNode(port uint16, bootstrapURLs []string) (*Node, error) {
 
 // NewNodeWithID creates a new local DHT node with a specific node ID
 func NewNodeWithID(port uint16, bootstrapURLs []string, nodeID Key) (*Node, error) {
+	// Create UDP listener
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: int(port)})
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen on UDP port %d: %w", port, err)
+	}
+
+	return NewNodeFromConn(conn, bootstrapURLs, nodeID)
+}
+
+// NewNodeFromConn creates a new local DHT node using an existing network connection.
+// The connection must implement net.PacketConn (e.g., *net.UDPConn).
+func NewNodeFromConn(conn net.PacketConn, bootstrapURLs []string, nodeID Key) (*Node, error) {
 	// Parse bootstrap node URLs
 	bootstrapNodes := []*net.UDPAddr{}
 	for _, urlStr := range bootstrapURLs {
@@ -158,18 +170,17 @@ func NewNodeWithID(port uint16, bootstrapURLs []string, nodeID Key) (*Node, erro
 		return nil, fmt.Errorf("no valid bootstrap nodes provided")
 	}
 
-	// Create UDP listener
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: int(port)})
-	if err != nil {
-		return nil, fmt.Errorf("failed to listen on UDP port %d: %w", port, err)
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return nil, fmt.Errorf("connection does not use UDP addresses")
 	}
 
 	node := &Node{
 		id:             nodeID,
 		conn:           conn,
-		port:           port,
+		port:           uint16(localAddr.Port),
 		bootstrapNodes: bootstrapNodes,
-		address:        conn.LocalAddr().(*net.UDPAddr),
+		address:        localAddr,
 		lastSeen:       time.Now(),
 	}
 
@@ -182,7 +193,7 @@ func NewNodeWithID(port uint16, bootstrapURLs []string, nodeID Key) (*Node, erro
 	// Start background node pool maintenance
 	node.startNodePoolMaintenance()
 
-	log.Info("created DHT node", "sub", "dht", "id", nodeID.Hex()[:16], "port", port)
+	log.Info("created DHT node", "sub", "dht", "id", nodeID.Hex()[:16], "port", node.port)
 
 	return node, nil
 }
@@ -499,13 +510,19 @@ func (n *Node) Serve(ctx context.Context) error {
 			n.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 
 			// Read incoming packet
-			nBytes, remoteAddr, err := n.conn.ReadFromUDP(buf)
+			nBytes, remoteAddr, err := n.conn.ReadFrom(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					// Timeout is expected, continue to check context
 					continue
 				}
 				log.Warn("error reading packet", "sub", "dht", "err", err)
+				continue
+			}
+
+			udpAddr, ok := remoteAddr.(*net.UDPAddr)
+			if !ok {
+				log.Debug("ignoring non-UDP packet", "sub", "dht", "addr", remoteAddr)
 				continue
 			}
 
@@ -516,10 +533,10 @@ func (n *Node) Serve(ctx context.Context) error {
 				continue
 			}
 
-			msg.Origin = remoteAddr
+			msg.Origin = udpAddr
 
 			// Handle the message based on type
-			go n.handleIncomingMessage(&msg, remoteAddr)
+			go n.handleIncomingMessage(&msg, udpAddr)
 		}
 	}
 }
@@ -581,7 +598,7 @@ func (n *Node) sendResponse(response *Message, remoteAddr *net.UDPAddr, label st
 		return
 	}
 
-	if _, err := n.conn.WriteToUDP(data, remoteAddr); err != nil {
+	if _, err := n.conn.WriteTo(data, remoteAddr); err != nil {
 		log.Warn("failed to send "+label+" response", "sub", "dht", "addr", remoteAddr, "err", err)
 		return
 	}

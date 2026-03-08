@@ -29,7 +29,7 @@ const (
 // - num: total number of infohashes in the node's storage
 // - samples: concatenated 20-byte infohashes
 // - nodes: nodes close to the target (for iterative lookups)
-func SampleInfohashes(conn *net.UDPConn, addr *net.UDPAddr, nodeID, target Key, timeoutSeconds int) (TransactionID, *Message, error) {
+func SampleInfohashes(conn net.PacketConn, addr *net.UDPAddr, nodeID, target Key, timeoutSeconds int) (TransactionID, *Message, error) {
 	args := Arguments{
 		ID:     nodeID[:],
 		Target: target[:],

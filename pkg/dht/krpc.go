@@ -337,7 +337,7 @@ func ParseCompactPeerInfoIPv6(data []byte) []*net.UDPAddr {
 }
 
 // SendQuery sends a KRPC query and waits for a response
-func SendQuery(conn *net.UDPConn, addr *net.UDPAddr, query *Message, timeoutSeconds int) (*Message, error) {
+func SendQuery(conn net.PacketConn, addr net.Addr, query *Message, timeoutSeconds int) (*Message, error) {
 	// Encode the query
 	data, err := query.EncodeBencode()
 	if err != nil {
@@ -345,7 +345,7 @@ func SendQuery(conn *net.UDPConn, addr *net.UDPAddr, query *Message, timeoutSeco
 	}
 
 	// Send the query
-	if _, err := conn.WriteToUDP(data, addr); err != nil {
+	if _, err := conn.WriteTo(data, addr); err != nil {
 		return nil, fmt.Errorf("failed to send query: %w", err)
 	}
 
@@ -357,7 +357,7 @@ func SendQuery(conn *net.UDPConn, addr *net.UDPAddr, query *Message, timeoutSeco
 
 	// Read response with timeout
 	buf := make([]byte, 2048)
-	n, origin, err := conn.ReadFromUDP(buf)
+	n, origin, err := conn.ReadFrom(buf)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
@@ -368,12 +368,14 @@ func SendQuery(conn *net.UDPConn, addr *net.UDPAddr, query *Message, timeoutSeco
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	resp.Origin = origin
+	if udpAddr, ok := origin.(*net.UDPAddr); ok {
+		resp.Origin = udpAddr
+	}
 	return &resp, nil
 }
 
 // PingNode sends a ping query to a node
-func PingNode(conn *net.UDPConn, addr *net.UDPAddr, nodeID Key, timeoutSeconds int) (TransactionID, *Message, error) {
+func PingNode(conn net.PacketConn, addr *net.UDPAddr, nodeID Key, timeoutSeconds int) (TransactionID, *Message, error) {
 	query := NewQuery(MethodPing, Arguments{
 		ID: nodeID[:],
 	})
@@ -387,13 +389,13 @@ func PingNode(conn *net.UDPConn, addr *net.UDPAddr, nodeID Key, timeoutSeconds i
 }
 
 // FindNode sends a find_node query to locate nodes close to a target
-func FindNode(conn *net.UDPConn, addr *net.UDPAddr, nodeID, target Key, timeoutSeconds int) (TransactionID, *Message, error) {
+func FindNode(conn net.PacketConn, addr *net.UDPAddr, nodeID, target Key, timeoutSeconds int) (TransactionID, *Message, error) {
 	return FindNodeWithWant(conn, addr, nodeID, target, nil, timeoutSeconds)
 }
 
 // FindNodeWithWant sends a find_node query with optional want parameter (BEP 32)
 // want can be nil (default behavior), or []string{"n4"}, []string{"n6"}, or []string{"n4", "n6"}
-func FindNodeWithWant(conn *net.UDPConn, addr *net.UDPAddr, nodeID, target Key, want []string, timeoutSeconds int) (TransactionID, *Message, error) {
+func FindNodeWithWant(conn net.PacketConn, addr *net.UDPAddr, nodeID, target Key, want []string, timeoutSeconds int) (TransactionID, *Message, error) {
 	args := Arguments{
 		ID:     nodeID[:],
 		Target: target[:],
@@ -415,13 +417,13 @@ func FindNodeWithWant(conn *net.UDPConn, addr *net.UDPAddr, nodeID, target Key, 
 }
 
 // GetPeers sends a get_peers query to find peers for an info hash
-func GetPeers(conn *net.UDPConn, addr *net.UDPAddr, nodeID, infoHash Key, timeoutSeconds int) (TransactionID, *Message, error) {
+func GetPeers(conn net.PacketConn, addr *net.UDPAddr, nodeID, infoHash Key, timeoutSeconds int) (TransactionID, *Message, error) {
 	return GetPeersWithWant(conn, addr, nodeID, infoHash, nil, timeoutSeconds)
 }
 
 // GetPeersWithWant sends a get_peers query with optional want parameter (BEP 32)
 // want can be nil (default behavior), or []string{"n4"}, []string{"n6"}, or []string{"n4", "n6"}
-func GetPeersWithWant(conn *net.UDPConn, addr *net.UDPAddr, nodeID, infoHash Key, want []string, timeoutSeconds int) (TransactionID, *Message, error) {
+func GetPeersWithWant(conn net.PacketConn, addr *net.UDPAddr, nodeID, infoHash Key, want []string, timeoutSeconds int) (TransactionID, *Message, error) {
 	args := Arguments{
 		ID:       nodeID[:],
 		InfoHash: infoHash[:],
@@ -444,14 +446,14 @@ func GetPeersWithWant(conn *net.UDPConn, addr *net.UDPAddr, nodeID, infoHash Key
 
 // AnnouncePeer announces that the peer controlling this node is downloading a torrent
 // on the specified port. The token must be from a recent get_peers response from the same node.
-func AnnouncePeer(conn *net.UDPConn, addr *net.UDPAddr, nodeID, infoHash Key, port int, token []byte, timeoutSeconds int) (TransactionID, *Message, error) {
+func AnnouncePeer(conn net.PacketConn, addr *net.UDPAddr, nodeID, infoHash Key, port int, token []byte, timeoutSeconds int) (TransactionID, *Message, error) {
 	return AnnouncePeerWithImpliedPort(conn, addr, nodeID, infoHash, port, token, false, timeoutSeconds)
 }
 
 // AnnouncePeerWithImpliedPort announces a peer with optional implied_port parameter (BEP 5)
 // If impliedPort is true, the port argument is ignored and the source UDP port is used instead.
 // This is useful for NAT traversal and uTP support.
-func AnnouncePeerWithImpliedPort(conn *net.UDPConn, addr *net.UDPAddr, nodeID, infoHash Key, port int, token []byte, impliedPort bool, timeoutSeconds int) (TransactionID, *Message, error) {
+func AnnouncePeerWithImpliedPort(conn net.PacketConn, addr *net.UDPAddr, nodeID, infoHash Key, port int, token []byte, impliedPort bool, timeoutSeconds int) (TransactionID, *Message, error) {
 	args := Arguments{
 		ID:       nodeID[:],
 		InfoHash: infoHash[:],

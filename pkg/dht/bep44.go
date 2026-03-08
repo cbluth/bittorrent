@@ -17,7 +17,7 @@ import (
 
 // GetImmutable sends a get query for an immutable item (BEP 44)
 // target is the SHA-1 hash of the value
-func GetImmutable(conn *net.UDPConn, addr *net.UDPAddr, nodeID, target Key, timeoutSeconds int) (TransactionID, *Message, error) {
+func GetImmutable(conn net.PacketConn, addr *net.UDPAddr, nodeID, target Key, timeoutSeconds int) (TransactionID, *Message, error) {
 	args := Arguments{
 		ID:     nodeID[:],
 		Target: target[:],
@@ -35,7 +35,7 @@ func GetImmutable(conn *net.UDPConn, addr *net.UDPAddr, nodeID, target Key, time
 
 // GetMutable sends a get query for a mutable item (BEP 44)
 // target is the SHA-1 hash of the public key (+ optional salt)
-func GetMutable(conn *net.UDPConn, addr *net.UDPAddr, nodeID, target Key, timeoutSeconds int) (TransactionID, *Message, error) {
+func GetMutable(conn net.PacketConn, addr *net.UDPAddr, nodeID, target Key, timeoutSeconds int) (TransactionID, *Message, error) {
 	// For mutable items, the target calculation is the same as immutable
 	// The difference is in the response which will include k, seq, sig
 	return GetImmutable(conn, addr, nodeID, target, timeoutSeconds)
@@ -43,7 +43,7 @@ func GetMutable(conn *net.UDPConn, addr *net.UDPAddr, nodeID, target Key, timeou
 
 // PutImmutable sends a put query for an immutable item (BEP 44)
 // The target (key) is calculated as SHA-1(v)
-func PutImmutable(conn *net.UDPConn, addr *net.UDPAddr, nodeID Key, token []byte, value interface{}, timeoutSeconds int) (TransactionID, *Message, error) {
+func PutImmutable(conn net.PacketConn, addr *net.UDPAddr, nodeID Key, token []byte, value interface{}, timeoutSeconds int) (TransactionID, *Message, error) {
 	args := Arguments{
 		ID:    nodeID[:],
 		Token: token,
@@ -64,7 +64,7 @@ func PutImmutable(conn *net.UDPConn, addr *net.UDPAddr, nodeID Key, token []byte
 // publicKey is the 32-byte ed25519 public key
 // signature is the 64-byte ed25519 signature of (salt + seq + v)
 // cas is optional compare-and-swap value (expected sequence number)
-func PutMutable(conn *net.UDPConn, addr *net.UDPAddr, nodeID Key, token []byte, publicKey []byte, seq int64, signature []byte, value interface{}, salt []byte, cas *int64, timeoutSeconds int) (TransactionID, *Message, error) {
+func PutMutable(conn net.PacketConn, addr *net.UDPAddr, nodeID Key, token []byte, publicKey []byte, seq int64, signature []byte, value interface{}, salt []byte, cas *int64, timeoutSeconds int) (TransactionID, *Message, error) {
 	args := Arguments{
 		ID:    nodeID[:],
 		Token: token,
