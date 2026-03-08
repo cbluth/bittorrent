@@ -1,0 +1,11 @@
+#
+
+bin
+tmp
+tmp/*
+bin/*
+bt.log
+!cmd/bt
+!pkg/bt
+scratch
+scratch*
