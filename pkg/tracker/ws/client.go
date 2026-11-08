@@ -16,7 +16,6 @@ package ws
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,7 +67,6 @@ type Client struct {
 }
 
 // Run connects to the tracker and processes messages until ctx is cancelled.
-// Returns a non-nil error unless ctx was cancelled.
 func (c *Client) Run(ctx context.Context) error {
 	if c.NumWant <= 0 {
 		c.NumWant = defaultNumWant
@@ -76,9 +74,39 @@ func (c *Client) Run(ctx context.Context) error {
 	if len(c.ICEServers) == 0 {
 		c.ICEServers = defaultICEServers
 	}
+	backoff := time.Second
+	for ctx.Err() == nil {
+		if err := c.runSession(ctx); err != nil {
+			log.Warn("tracker connection ended", "sub", "tracker", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > time.Minute {
+			backoff = time.Minute
+		}
+	}
+	return nil
+}
+
+func (c *Client) runSession(ctx context.Context) error {
 	c.mu.Lock()
+	for _, pc := range c.pending {
+		pc.Close()
+	}
 	c.pending = make(map[string]*webrtc.PeerConnection)
 	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		for _, pc := range c.pending {
+			pc.Close()
+		}
+		c.pending = nil
+		c.mu.Unlock()
+	}()
 
 	wsConn, _, err := websocket.Dial(ctx, c.URL, nil)
 	if err != nil {
@@ -86,19 +114,49 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	defer wsConn.Close(websocket.StatusNormalClosure, "")
 
-	if err := c.sendAnnounce(ctx, wsConn, "started"); err != nil {
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if err := c.sendAnnounce(sessionCtx, wsConn, "started"); err != nil {
 		return fmt.Errorf("initial announce: %w", err)
 	}
 
+	intervals := make(chan time.Duration, 1)
+	go func() {
+		interval := 2 * time.Minute
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		for {
+			select {
+			case <-sessionCtx.Done():
+				return
+			case interval = <-intervals:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(interval)
+			case <-timer.C:
+				if err := c.sendAnnounce(sessionCtx, wsConn, ""); err != nil {
+					cancel()
+					return
+				}
+				timer.Reset(interval)
+			}
+		}
+	}()
+
 	for {
 		var raw json.RawMessage
-		if err := wsjson.Read(ctx, wsConn, &raw); err != nil {
+		if err := wsjson.Read(sessionCtx, wsConn, &raw); err != nil {
 			if ctx.Err() != nil {
-				return nil // clean shutdown
+				return nil
 			}
 			return fmt.Errorf("read: %w", err)
 		}
-		if err := c.dispatch(ctx, wsConn, raw); err != nil {
+		if err := c.dispatch(sessionCtx, wsConn, raw, intervals); err != nil {
 			log.Warn("dispatch error", "sub", "tracker", "err", err)
 		}
 	}
@@ -143,10 +201,23 @@ func (c *Client) sendAnnounce(ctx context.Context, wsConn *websocket.Conn, event
 			return ctx.Err()
 		}
 
-		offerID := randHex(10)
+		var offerBytes [20]byte
+		if _, err := rand.Read(offerBytes[:]); err != nil {
+			pc.Close()
+			return fmt.Errorf("generate offer ID: %w", err)
+		}
+		offerID := binaryText(offerBytes[:])
 		c.mu.Lock()
 		c.pending[offerID] = pc
 		c.mu.Unlock()
+		time.AfterFunc(50*time.Second, func() {
+			c.mu.Lock()
+			if c.pending[offerID] == pc {
+				delete(c.pending, offerID)
+				pc.Close()
+			}
+			c.mu.Unlock()
+		})
 
 		localSDP := pc.LocalDescription()
 		sdpJSON, err := json.Marshal(localSDP)
@@ -162,8 +233,8 @@ func (c *Client) sendAnnounce(ctx context.Context, wsConn *websocket.Conn, event
 
 	req := AnnounceRequest{
 		Action:   "announce",
-		InfoHash: c.InfoHash[:],
-		PeerID:   c.PeerID[:],
+		InfoHash: binaryString(c.InfoHash[:]),
+		PeerID:   binaryString(c.PeerID[:]),
 		Offers:   offers,
 		NumWant:  c.NumWant,
 		Event:    event,
@@ -172,15 +243,16 @@ func (c *Client) sendAnnounce(ctx context.Context, wsConn *websocket.Conn, event
 }
 
 // dispatch routes an incoming tracker message to the right handler.
-func (c *Client) dispatch(ctx context.Context, wsConn *websocket.Conn, raw json.RawMessage) error {
+func (c *Client) dispatch(ctx context.Context, wsConn *websocket.Conn, raw json.RawMessage, intervals chan<- time.Duration) error {
 	// Decode just enough to distinguish offer vs answer vs tracker response.
 	var envelope struct {
 		Action   string                     `json:"action"`
+		Interval int                        `json:"interval"`
 		Offer    *webrtc.SessionDescription `json:"offer"`
 		Answer   *webrtc.SessionDescription `json:"answer"`
 		OfferID  string                     `json:"offer_id"`
-		PeerID   []byte                     `json:"peer_id"`
-		InfoHash []byte                     `json:"info_hash"`
+		PeerID   binaryString               `json:"peer_id"`
+		InfoHash binaryString               `json:"info_hash"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return fmt.Errorf("unmarshal envelope: %w", err)
@@ -188,11 +260,16 @@ func (c *Client) dispatch(ctx context.Context, wsConn *websocket.Conn, raw json.
 
 	switch {
 	case envelope.Offer != nil:
-		return c.handleOffer(ctx, wsConn, envelope.Offer, envelope.OfferID, envelope.PeerID)
+		return c.handleOffer(ctx, wsConn, envelope.Offer, envelope.OfferID, []byte(envelope.PeerID))
 	case envelope.Answer != nil:
 		return c.handleAnswer(envelope.Answer, envelope.OfferID)
 	default:
-		// Tracker response (interval, complete/incomplete counts) — nothing to act on.
+		if envelope.Action == "announce" && envelope.Interval > 0 {
+			select {
+			case intervals <- time.Duration(envelope.Interval) * time.Second:
+			default:
+			}
+		}
 		return nil
 	}
 }
@@ -248,13 +325,13 @@ func (c *Client) handleOffer(
 	}
 
 	raw := json.RawMessage(answerJSON)
-	req := AnnounceRequest{
+	req := answerRequest{
 		Action:   "announce",
-		InfoHash: c.InfoHash[:],
-		PeerID:   c.PeerID[:],
+		InfoHash: binaryString(c.InfoHash[:]),
+		PeerID:   binaryString(c.PeerID[:]),
 		Answer:   &raw,
 		OfferID:  offerID,
-		ToPeerID: fromPeerID,
+		ToPeerID: binaryString(fromPeerID),
 	}
 	return wsjson.Write(ctx, wsConn, req)
 }
@@ -284,11 +361,12 @@ func (c *Client) hookDataChannel(dc *webrtc.DataChannel, pc *webrtc.PeerConnecti
 	})
 }
 
-// randHex returns n random bytes encoded as a hex string.
-func randHex(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+func binaryText(b []byte) string {
+	runes := make([]rune, len(b))
+	for i, v := range b {
+		runes[i] = rune(v)
+	}
+	return string(runes)
 }
 
 // --- DataChannel → net.Conn adapter ---
