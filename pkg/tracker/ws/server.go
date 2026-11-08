@@ -50,6 +50,8 @@ type Swarm struct {
 // Peer is a connected WebSocket client.
 type Peer struct {
 	PeerID     string
+	owner      *Peer
+	peerIDs    map[string]struct{}
 	conn       *websocket.Conn
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -128,6 +130,7 @@ func (t *Tracker) handleConnection(w http.ResponseWriter, r *http.Request) {
 		ctx:        ctx,
 		cancel:     cancel,
 		InfoHashes: make([]string, 0),
+		peerIDs:    make(map[string]struct{}),
 		IP:         ip,
 		LastSeen:   time.Now(),
 	}
@@ -174,19 +177,20 @@ func (t *Tracker) handleAnnounce(peer *Peer, req *AnnounceRequest) {
 		return
 	}
 
-	infoHashHex := hex.EncodeToString(req.InfoHash)
-	peerIDHex := hex.EncodeToString(req.PeerID)
+	infoHashHex := hex.EncodeToString([]byte(req.InfoHash))
+	peerIDHex := hex.EncodeToString([]byte(req.PeerID))
 
 	peer.mu.Lock()
 	if peer.PeerID == "" {
 		peer.PeerID = peerIDHex
 	}
+	peer.peerIDs[peerIDHex] = struct{}{}
 	peer.mu.Unlock()
 
 	swarm := t.getOrCreateSwarm(infoHashHex)
 
 	if req.Event == "stopped" {
-		t.removePeer(swarm, peer)
+		t.removePeer(swarm, peer, peerIDHex)
 		return
 	}
 
@@ -204,30 +208,32 @@ func (t *Tracker) handleAnnounce(peer *Peer, req *AnnounceRequest) {
 	}
 	peer.mu.Unlock()
 
-	t.addPeer(swarm, peer, req)
+	if req.Answer != nil {
+		answerAnnounce := *req
+		answerAnnounce.Left = 1
+		t.addPeer(swarm, peer, &answerAnnounce, true)
+		t.routeAnswer(peer, req, swarm)
+		return
+	}
 
-	// Send tracker response only for non-answer messages.
-	if req.Answer == nil {
-		swarm.mu.RLock()
-		resp := AnnounceResponse{
-			Action:     "announce",
-			Interval:   int(t.interval.Seconds()),
-			InfoHash:   req.InfoHash,
-			Complete:   swarm.Seeders,
-			Incomplete: swarm.Leechers,
-		}
-		swarm.mu.RUnlock()
-		if err := peer.writeJSON(resp); err != nil {
-			t.log.Warn("announce response failed", "peer", shortID(peerIDHex), "err", err)
-			return
-		}
+	t.addPeer(swarm, peer, req, false)
+
+	swarm.mu.RLock()
+	resp := AnnounceResponse{
+		Action:     "announce",
+		Interval:   int(t.interval.Seconds()),
+		InfoHash:   req.InfoHash,
+		Complete:   swarm.Seeders,
+		Incomplete: swarm.Leechers,
+	}
+	swarm.mu.RUnlock()
+	if err := peer.writeJSON(resp); err != nil {
+		t.log.Warn("announce response failed", "peer", shortID(peerIDHex), "err", err)
+		return
 	}
 
 	if len(req.Offers) > 0 {
 		t.distributeOffers(peer, req, swarm)
-	}
-	if req.Answer != nil {
-		t.routeAnswer(peer, req, swarm)
 	}
 }
 
@@ -244,7 +250,7 @@ func (t *Tracker) distributeOffers(from *Peer, req *AnnounceRequest, swarm *Swar
 		if len(targets) >= n {
 			break
 		}
-		if peerID == from.PeerID {
+		if peerID == hex.EncodeToString([]byte(req.PeerID)) {
 			continue
 		}
 		targets = append(targets, p)
@@ -270,7 +276,7 @@ func (t *Tracker) routeAnswer(from *Peer, req *AnnounceRequest, swarm *Swarm) {
 		_ = from.writeJSON(ErrorResponse{FailureReason: "invalid to_peer_id"})
 		return
 	}
-	toPeerIDHex := hex.EncodeToString(req.ToPeerID)
+	toPeerIDHex := hex.EncodeToString([]byte(req.ToPeerID))
 
 	// Snapshot target pointer before releasing lock.
 	swarm.mu.RLock()
@@ -302,7 +308,7 @@ func (t *Tracker) handleScrape(peer *Peer, req *AnnounceRequest) {
 
 	if len(req.InfoHash) == 20 {
 		// Single-torrent scrape.
-		ih := hex.EncodeToString(req.InfoHash)
+		ih := hex.EncodeToString([]byte(req.InfoHash))
 		t.mu.RLock()
 		swarm, ok := t.swarms[ih]
 		t.mu.RUnlock()
@@ -354,47 +360,61 @@ func (t *Tracker) getOrCreateSwarm(infoHash string) *Swarm {
 	return swarm
 }
 
-func (t *Tracker) addPeer(swarm *Swarm, peer *Peer, req *AnnounceRequest) {
+func (t *Tracker) addPeer(swarm *Swarm, peer *Peer, req *AnnounceRequest, onlyIfAbsent bool) {
 	swarm.mu.Lock()
 	defer swarm.mu.Unlock()
 
-	if existing, ok := swarm.Peers[peer.PeerID]; ok {
+	peerID := hex.EncodeToString([]byte(req.PeerID))
+	existing, present := swarm.Peers[peerID]
+	if present && onlyIfAbsent {
+		return
+	}
+	if present {
 		wasSeeder := existing.Left == 0
-		existing.Left = req.Left
-		existing.Uploaded = req.Uploaded
-		existing.Downloaded = req.Downloaded
-		existing.LastSeen = time.Now()
-		if !wasSeeder && existing.Left == 0 {
-			swarm.Seeders++
-			swarm.Leechers--
-			swarm.Completed++
+		isSeeder := req.Left == 0
+		if wasSeeder != isSeeder {
+			if isSeeder {
+				swarm.Seeders++
+				swarm.Leechers--
+				swarm.Completed++
+			} else {
+				swarm.Seeders--
+				swarm.Leechers++
+			}
 		}
+	} else if req.Left == 0 {
+		swarm.Seeders++
 	} else {
-		peer.Left = req.Left
-		peer.Uploaded = req.Uploaded
-		peer.Downloaded = req.Downloaded
-		swarm.Peers[peer.PeerID] = peer
-		if req.Left == 0 {
-			swarm.Seeders++
-		} else {
-			swarm.Leechers++
-		}
-		if req.Event == "completed" {
-			swarm.Completed++
-		}
+		swarm.Leechers++
+	}
+
+	swarm.Peers[peerID] = &Peer{
+		PeerID:     peerID,
+		owner:      peer,
+		conn:       peer.conn,
+		ctx:        peer.ctx,
+		cancel:     peer.cancel,
+		IP:         peer.IP,
+		Left:       req.Left,
+		Uploaded:   req.Uploaded,
+		Downloaded: req.Downloaded,
+		LastSeen:   time.Now(),
+	}
+	if !present && req.Event == "completed" {
+		swarm.Completed++
 	}
 }
 
-func (t *Tracker) removePeer(swarm *Swarm, peer *Peer) {
+func (t *Tracker) removePeer(swarm *Swarm, peer *Peer, peerID string) {
 	swarm.mu.Lock()
 	defer swarm.mu.Unlock()
-	if p, ok := swarm.Peers[peer.PeerID]; ok {
+	if p, ok := swarm.Peers[peerID]; ok && p.owner == peer {
 		if p.Left == 0 {
 			swarm.Seeders--
 		} else {
 			swarm.Leechers--
 		}
-		delete(swarm.Peers, peer.PeerID)
+		delete(swarm.Peers, peerID)
 	}
 }
 
@@ -402,6 +422,10 @@ func (t *Tracker) cleanupPeer(peer *Peer) {
 	peer.mu.Lock()
 	infoHashes := append([]string{}, peer.InfoHashes...)
 	peerID := peer.PeerID
+	peerIDs := make([]string, 0, len(peer.peerIDs))
+	for id := range peer.peerIDs {
+		peerIDs = append(peerIDs, id)
+	}
 	peer.mu.Unlock()
 
 	// Snapshot swarm pointers, then remove outside the tracker lock.
@@ -415,7 +439,9 @@ func (t *Tracker) cleanupPeer(peer *Peer) {
 	t.mu.RUnlock()
 
 	for _, s := range swarms {
-		t.removePeer(s, peer)
+		for _, id := range peerIDs {
+			t.removePeer(s, peer, id)
+		}
 	}
 
 	if peerID != "" {
@@ -457,7 +483,6 @@ func (t *Tracker) evictStale() {
 				} else {
 					swarm.Leechers--
 				}
-				peer.cancel() // signals handleMessages to exit
 				delete(swarm.Peers, peerID)
 				t.log.Debug("evicted stale peer", "peer", shortID(peerID), "swarm", shortID(ih))
 			}
